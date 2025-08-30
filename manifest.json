@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Range Picker Scanner",
-  "version": "1.2.0",
-  "description": "Scans for date-range elements when 'View Rates' is pressed on disneyworld.disney.go.com.",
+  "version": "1.3.0",
+  "description": "Scans for date-range elements when 'View Rates' is pressed on Disney booking pages.",
 
   "action": {
     "default_title": "Range Picker Scanner"
@@ -16,12 +16,18 @@
   "permissions": ["activeTab", "scripting"],
 
   "host_permissions": [
-    "https://disneyworld.disney.go.com/*"
+    "https://disneyworld.disney.go.com/*",
+    "https://*.disney.go.com/*",
+    "https://*.go.com/*"
   ],
 
   "content_scripts": [
     {
-      "matches": ["https://disneyworld.disney.go.com/*"],
+      "matches": [
+        "https://disneyworld.disney.go.com/*",
+        "https://*.disney.go.com/*",
+        "https://*.go.com/*"
+      ],
       "js": ["listener.js"],
       "run_at": "document_idle",
       "all_frames": true
@@ -31,7 +37,11 @@
   "web_accessible_resources": [
     {
       "resources": ["scan.js"],
-      "matches": ["https://disneyworld.disney.go.com/*"]
+      "matches": [
+        "https://disneyworld.disney.go.com/*",
+        "https://*.disney.go.com/*",
+        "https://*.go.com/*"
+      ]
     }
   ]
 }
