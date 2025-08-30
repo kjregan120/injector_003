@@ -1,12 +1,10 @@
-// scan.js — exposes window.__runRangeScan and also runs immediately when injected
+// scan.js — richer heuristics; exposes window.__runRangeScan and also runs immediately when injected
 (() => {
   function* iterAllNodes(root) {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
     let node = walker.currentNode;
     while (node) {
       yield /** @type {Element} */ (node);
-      // Recurse into shadow roots if present
-      // (we depth-first traverse by pushing a new walker for the shadow root)
       const sr = /** @type {Element} */ (node).shadowRoot;
       if (sr) {
         yield* iterAllNodes(sr);
@@ -15,35 +13,57 @@
     }
   }
 
-  function toISO(sec) {
-    return sec && !Number.isNaN(sec) ? new Date(sec * 1000).toISOString() : null;
+  const toISO = (sec) => (sec && !Number.isNaN(sec) ? new Date(sec * 1000).toISOString() : null);
+
+  function pickNumericAttr(el, names) {
+    for (const n of names) {
+      if (el.hasAttribute && el.hasAttribute(n)) {
+        const v = Number(el.getAttribute(n));
+        if (!Number.isNaN(v) && Number.isFinite(v)) return v;
+      }
+    }
+    return null;
   }
 
   function scanDocument(doc, frameUrl, out) {
     try {
       for (const el of iterAllNodes(doc)) {
         const tag = el.tagName?.toLowerCase?.() || "";
-        const hasRangeAttrs =
+        const hasKnownAttrs =
           (/** @type {Element} */ (el)).hasAttribute?.("date-from") &&
           (/** @type {Element} */ (el)).hasAttribute?.("date-to");
 
-        if (tag === "range-datepicker-cell" || hasRangeAttrs) {
-          const sSec = Number((/** @type {Element} */ (el)).getAttribute("date-from"));
-          const eSec = Number((/** @type {Element} */ (el)).getAttribute("date-to")); // often exclusive
-          out.all.push({
-            frameUrl,
-            tag,
-            id: (/** @type {Element} */ (el)).id || null,
-            startSec: sSec,
-            endSec: eSec,
-            startUTC: toISO(sSec),
-            endExclusiveUTC: toISO(eSec),
-            endInclusiveUTC: eSec ? new Date(eSec * 1000 - 1).toISOString() : null,
-            days:
-              sSec && eSec
-                ? Math.max(1, Math.round((eSec - sSec) / 86400))
-                : null,
-          });
+        const hasAltAttrs =
+          (/** @type {Element} */ (el)).hasAttribute?.("data-from") &&
+          (/** @type {Element} */ (el)).hasAttribute?.("data-to");
+
+        // Heuristic: any element that advertises "check-in/out" in aria-label or data-*
+        const aria = (/** @type {Element} */ (el)).getAttribute?.("aria-label") || "";
+        const dataset = /** @type {any} */ (el).dataset || {};
+        const datasetKeys = Object.keys(dataset).join(",");
+        const looksLikeCheckRange =
+          /check.?in|check.?out|date.?range/i.test(aria) ||
+          /from|to|start|end/i.test(datasetKeys);
+
+        if (tag === "range-datepicker-cell" || hasKnownAttrs || hasAltAttrs || looksLikeCheckRange) {
+          const sSec = pickNumericAttr(/** @type {Element} */ (el), ["date-from", "data-from", "from", "start"]);
+          const eSec = pickNumericAttr(/** @type {Element} */ (el), ["date-to", "data-to", "to", "end"]);
+          if (sSec || eSec) {
+            out.all.push({
+              frameUrl,
+              tag,
+              id: (/** @type {Element} */ (el)).id || null,
+              startSec: sSec,
+              endSec: eSec,
+              startUTC: toISO(sSec),
+              endExclusiveUTC: toISO(eSec),
+              endInclusiveUTC: eSec ? new Date(eSec * 1000 - 1).toISOString() : null,
+              days:
+                sSec && eSec
+                  ? Math.max(1, Math.round((eSec - sSec) / 86400))
+                  : null,
+            });
+          }
         }
       }
     } catch (err) {
@@ -111,7 +131,7 @@
     // If we found nothing yet, retry briefly while app hydrates
     if (out.all.length === 0) {
       const START = Date.now();
-      const MAX_MS = 6000;
+      const MAX_MS = 7000;
       let timer = null;
 
       const runDebounced = () => {

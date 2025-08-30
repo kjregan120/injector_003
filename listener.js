@@ -1,17 +1,34 @@
-// listener.js — auto-runs on disneyworld.disney.go.com
-// When the <wdpr-button id="findPricesButton"> is activated, run the scanner.
-
+// listener.js — robust detection for "View Rates" activation on disneyworld.disney.go.com
 (() => {
+  // Normalize text helper
+  const norm = (s) => (s || "").trim().replace(/\s+/g, " ").toLowerCase();
+
+  function isViewRatesNode(n) {
+    if (!n || n.nodeType !== Node.ELEMENT_NODE) return false;
+    const el = /** @type {Element} */ (n);
+    const tag = el.tagName;
+    if (tag === "WDPR-BUTTON" || tag === "BUTTON" || tag === "A" || el.getAttribute("role") === "button") {
+      if (el.id === "findPricesButton") return true;
+      const txt = norm(el.textContent);
+      if (/view rates/.test(txt)) return true;
+    }
+    return false;
+  }
+
   function isViewRatesInPath(e) {
     if (!e || typeof e.composedPath !== "function") return false;
     const path = e.composedPath();
-    return path.some(
-      n =>
-        n &&
-        n.nodeType === Node.ELEMENT_NODE &&
-        n.tagName === "WDPR-BUTTON" &&
-        n.id === "findPricesButton"
-    );
+    return path.some(isViewRatesNode);
+  }
+
+  function findViewRatesElement() {
+    // Direct lookup (outside shadow roots)
+    let el =
+      document.getElementById("findPricesButton") ||
+      document.querySelector("wdpr-button#findPricesButton") ||
+      Array.from(document.querySelectorAll("wdpr-button,button,a,[role='button']"))
+        .find((n) => isViewRatesNode(n));
+    return el || null;
   }
 
   function runScan() {
@@ -34,24 +51,84 @@
     console.log("[scanner] injected scan.js");
   }
 
-  // Mouse/touch activation
+  function runScanWithDelays() {
+    // Run immediately and again after a few delays to catch hydrated content
+    runScan();
+    setTimeout(runScan, 600);
+    setTimeout(runScan, 1600);
+    setTimeout(runScan, 3200);
+  }
+
+  // Global capture listeners (works through shadow DOM via composedPath)
   document.addEventListener(
     "click",
     (e) => {
-      if (isViewRatesInPath(e)) runScan();
+      if (isViewRatesInPath(e)) {
+        console.log("[scanner] View Rates click detected");
+        runScanWithDelays();
+      }
     },
-    true // capture to traverse custom element/shadow boundaries reliably
+    true
   );
 
-  // Keyboard activation (Enter/Space)
   document.addEventListener(
     "keydown",
     (e) => {
       const k = e.key || e.code;
-      if ((k === "Enter" || k === " ") && isViewRatesInPath(e)) runScan();
+      if ((k === "Enter" || k === " ") && isViewRatesInPath(e)) {
+        console.log("[scanner] View Rates key activation detected");
+        runScanWithDelays();
+      }
     },
     true
   );
+
+  // Attach a direct listener when/if the element appears (handles cases where composedPath doesn't include custom element)
+  const armDirectListener = () => {
+    const btn = findViewRatesElement();
+    if (btn && !btn.__scannerArmed) {
+      btn.addEventListener("click", () => {
+        console.log("[scanner] Direct listener: View Rates clicked");
+        runScanWithDelays();
+      }, true);
+      btn.addEventListener("keydown", (e) => {
+        const k = e.key || e.code;
+        if (k === "Enter" || k === " ") {
+          console.log("[scanner] Direct listener: View Rates key activation");
+          runScanWithDelays();
+        }
+      }, true);
+      btn.__scannerArmed = true;
+      console.log("[scanner] Direct listener armed on View Rates element");
+    }
+  };
+
+  // Observe DOM for late insertion
+  const mo = new MutationObserver(() => armDirectListener());
+  mo.observe(document.documentElement, { subtree: true, childList: true });
+  // Try immediately and after short delays
+  armDirectListener();
+  setTimeout(armDirectListener, 800);
+  setTimeout(armDirectListener, 2000);
+
+  // Re-arm on SPA route changes
+  ["popstate", "pushState", "replaceState"].forEach((evt) => {
+    window.addEventListener(evt, () => setTimeout(armDirectListener, 0));
+  });
+
+  // Patch history methods to emit events on SPA navigations
+  const _ps = history.pushState;
+  history.pushState = function () {
+    const r = _ps.apply(this, arguments);
+    window.dispatchEvent(new Event("pushState"));
+    return r;
+  };
+  const _rs = history.replaceState;
+  history.replaceState = function () {
+    const r = _rs.apply(this, arguments);
+    window.dispatchEvent(new Event("replaceState"));
+    return r;
+  };
 
   console.log("[scanner] listener armed for View Rates");
 })();
