@@ -1,5 +1,7 @@
-// scan.js — richer heuristics; exposes window.__runRangeScan and also runs immediately when injected
+// scan.js — v3: aggressive candidate discovery, richer logs, longer retries
 (() => {
+  const log = (...args) => console.log("[scanner]", ...args);
+
   function* iterAllNodes(root) {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
     let node = walker.currentNode;
@@ -25,45 +27,41 @@
     return null;
   }
 
-  function scanDocument(doc, frameUrl, out) {
+  function scanDocument(doc, frameUrl, out, dbg) {
     try {
       for (const el of iterAllNodes(doc)) {
         const tag = el.tagName?.toLowerCase?.() || "";
-        const hasKnownAttrs =
-          (/** @type {Element} */ (el)).hasAttribute?.("date-from") &&
-          (/** @type {Element} */ (el)).hasAttribute?.("date-to");
-
-        const hasAltAttrs =
-          (/** @type {Element} */ (el)).hasAttribute?.("data-from") &&
-          (/** @type {Element} */ (el)).hasAttribute?.("data-to");
-
-        // Heuristic: any element that advertises "check-in/out" in aria-label or data-*
-        const aria = (/** @type {Element} */ (el)).getAttribute?.("aria-label") || "";
-        const dataset = /** @type {any} */ (el).dataset || {};
-        const datasetKeys = Object.keys(dataset).join(",");
+        const attrs = el.getAttributeNames ? el.getAttributeNames() : [];
+        const attrStr = attrs.join(",");
+        const hasKnownAttrs = attrs.includes("date-from") && attrs.includes("date-to");
+        const hasAltAttrs = (attrs.includes("data-from") && attrs.includes("data-to")) ||
+                            (attrs.includes("from") && attrs.includes("to")) ||
+                            (attrs.includes("start") && attrs.includes("end"));
+        const aria = el.getAttribute?.("aria-label") || "";
         const looksLikeCheckRange =
           /check.?in|check.?out|date.?range/i.test(aria) ||
-          /from|to|start|end/i.test(datasetKeys);
+          /(date-?(from|to)|data-?(from|to)|from|to|start|end)/i.test(attrStr);
 
-        if (tag === "range-datepicker-cell" || hasKnownAttrs || hasAltAttrs || looksLikeCheckRange) {
+        const qualifies = tag === "range-datepicker-cell" || hasKnownAttrs || hasAltAttrs || looksLikeCheckRange;
+
+        if (qualifies) {
           const sSec = pickNumericAttr(/** @type {Element} */ (el), ["date-from", "data-from", "from", "start"]);
           const eSec = pickNumericAttr(/** @type {Element} */ (el), ["date-to", "data-to", "to", "end"]);
-          if (sSec || eSec) {
-            out.all.push({
-              frameUrl,
-              tag,
-              id: (/** @type {Element} */ (el)).id || null,
-              startSec: sSec,
-              endSec: eSec,
-              startUTC: toISO(sSec),
-              endExclusiveUTC: toISO(eSec),
-              endInclusiveUTC: eSec ? new Date(eSec * 1000 - 1).toISOString() : null,
-              days:
-                sSec && eSec
-                  ? Math.max(1, Math.round((eSec - sSec) / 86400))
-                  : null,
-            });
-          }
+          const candidate = {
+            frameUrl,
+            tag,
+            id: (/** @type {Element} */ (el)).id || null,
+            attrs: attrStr,
+            aria,
+            startSec: sSec,
+            endSec: eSec,
+            startUTC: toISO(sSec),
+            endExclusiveUTC: toISO(eSec),
+            endInclusiveUTC: eSec ? new Date(eSec * 1000 - 1).toISOString() : null,
+            days: sSec && eSec ? Math.max(1, Math.round((eSec - sSec) / 86400)) : null,
+          };
+          out.candidates.push(candidate);
+          if (sSec || eSec) out.all.push(candidate);
         }
       }
     } catch (err) {
@@ -72,13 +70,12 @@
   }
 
   async function runRangeScan() {
-    console.log("[scanner] runRangeScan started");
-    const out = { all: [], unique: [], blocked: [] };
+    log("runRangeScan started");
+    const out = { all: [], candidates: [], unique: [], blocked: [], stats: {} };
 
-    // Scan root document
+    const t0 = performance.now();
     scanDocument(document, location.href, out);
 
-    // Scan accessible iframes
     for (const frame of Array.from(document.querySelectorAll("iframe"))) {
       try {
         const src = frame.src || "about:blank";
@@ -91,6 +88,10 @@
         out.blocked.push(blocked);
       }
     }
+    const t1 = performance.now();
+    out.stats.scanMs = Math.round(t1 - t0);
+    out.stats.totalCandidates = out.candidates.length;
+    out.stats.totalWithNumbers = out.all.length;
 
     const key = r => `${r.startSec}-${r.endSec}`;
     const map = new Map();
@@ -101,78 +102,49 @@
     }
     out.unique = Array.from(map.values()).sort((a, b) => (b.count || 0) - (a.count || 0));
 
-    // Console output
+    // Logs
+    log(`scan finished in ${out.stats.scanMs}ms; candidates=${out.stats.totalCandidates}; withNumbers=${out.stats.totalWithNumbers}`);
+
     if (out.unique.length) {
       console.table(
-        out.unique.map(
-          ({ frameUrl, tag, id, startUTC, endInclusiveUTC, days, count }) => ({
-            frameUrl,
-            tag,
-            id,
-            startUTC,
-            endInclusiveUTC,
-            days,
-            count,
-          })
-        )
+        out.unique.map(({ frameUrl, tag, id, startUTC, endInclusiveUTC, days, count }) => ({
+          frameUrl, tag, id, startUTC, endInclusiveUTC, days, count
+        }))
       );
-      console.log("[scanner] Most common range:", out.unique[0]);
+      log("Most common range:", out.unique[0]);
     } else {
-      console.log("[scanner] No date-range elements found (yet).");
+      log("No elements with numeric date-from/to found.");
+      // Print top 5 candidates (by having promising attrs) to aid debugging
+      const sample = out.candidates.slice(0, 5).map(c => ({
+        frameUrl: c.frameUrl,
+        tag: c.tag,
+        id: c.id,
+        attrs: c.attrs,
+        aria: c.aria?.slice(0,120) || null
+      }));
+      if (sample.length) {
+        console.table(sample);
+        log("Shown up to 5 candidate elements that look like date range containers (but without numeric epoch attributes).");
+      }
     }
 
     if (out.blocked.length) {
       console.table(out.blocked);
     }
 
-    // Stash for inspection
     window.__pickerRanges = out;
 
-    // If we found nothing yet, retry briefly while app hydrates
     if (out.all.length === 0) {
+      // Longer retry window
       const START = Date.now();
-      const MAX_MS = 7000;
+      const MAX_MS = 16000;
       let timer = null;
 
       const runDebounced = () => {
         clearTimeout(timer);
         timer = setTimeout(() => {
-          const out2 = { all: [], unique: [], blocked: [] };
-          scanDocument(document, location.href, out2);
-          for (const frame of Array.from(document.querySelectorAll("iframe"))) {
-            try {
-              const src = frame.src || "about:blank";
-              const doc = frame.contentDocument;
-              if (doc) scanDocument(doc, src, out2);
-            } catch (err) {
-              const blocked = { src: frame.src || null, reason: String(err) };
-              try { blocked.sandbox = frame.getAttribute("sandbox") || null; } catch {}
-              try { blocked.referrerpolicy = frame.getAttribute("referrerpolicy") || null; } catch {}
-              out2.blocked.push(blocked);
-            }
-          }
-          const m2 = new Map();
-          for (const r of out2.all) {
-            const k = key(r);
-            if (!m2.has(k)) m2.set(k, { ...r, count: 1 });
-            else m2.get(k).count++;
-          }
-          out2.unique = Array.from(m2.values()).sort((a, b) => (b.count || 0) - (a.count || 0));
-
-          if (out2.unique.length) {
-            console.table(
-              out2.unique.map(({ frameUrl, tag, id, startUTC, endInclusiveUTC, days, count }) => ({
-                frameUrl, tag, id, startUTC, endInclusiveUTC, days, count
-              }))
-            );
-            console.log("[scanner] Most common range:", out2.unique[0]);
-            if (out2.blocked.length) console.table(out2.blocked);
-            window.__pickerRanges = out2;
-            obs.disconnect();
-          } else if (Date.now() - START > MAX_MS) {
-            obs.disconnect();
-          }
-        }, 150);
+          runRangeScan();
+        }, 250);
       };
 
       const obs = new MutationObserver(runDebounced);
@@ -182,17 +154,22 @@
         attributes: true,
       });
 
-      setTimeout(runDebounced, 500);
-      setTimeout(runDebounced, 1500);
-      setTimeout(runDebounced, 3000);
-      setTimeout(runDebounced, 5000);
+      // Seed a few retries
+      [600, 1600, 3200, 6000, 10000, 14000].forEach(ms => setTimeout(() => {
+        if (Date.now() - START < MAX_MS) runRangeScan();
+      }, ms));
+
+      setTimeout(() => obs.disconnect(), MAX_MS);
     }
 
     return window.__pickerRanges;
   }
 
-  // Expose callable entrypoint
-  try { window.__runRangeScan = runRangeScan; } catch {}
+  // Expose debugging helpers
+  try {
+    window.__runRangeScan = runRangeScan;
+    window.__debugScanCandidates = () => (window.__pickerRanges?.candidates || []);
+  } catch {}
 
   // Also auto-run when this file is injected
   runRangeScan();

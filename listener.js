@@ -1,14 +1,14 @@
-// listener.js — robust detection for "View Rates" activation on disneyworld.disney.go.com
+// listener.js — v3 robust hooks for "View Rates" and follow-on async UI/network
 (() => {
-  // Normalize text helper
+  const log = (...args) => console.log("[scanner]", ...args);
   const norm = (s) => (s || "").trim().replace(/\s+/g, " ").toLowerCase();
 
   function isViewRatesNode(n) {
     if (!n || n.nodeType !== Node.ELEMENT_NODE) return false;
     const el = /** @type {Element} */ (n);
+    if (el.id === "findPricesButton") return true;
     const tag = el.tagName;
     if (tag === "WDPR-BUTTON" || tag === "BUTTON" || tag === "A" || el.getAttribute("role") === "button") {
-      if (el.id === "findPricesButton") return true;
       const txt = norm(el.textContent);
       if (/view rates/.test(txt)) return true;
     }
@@ -21,102 +21,87 @@
     return path.some(isViewRatesNode);
   }
 
-  function findViewRatesElement() {
-    // Direct lookup (outside shadow roots)
-    let el =
-      document.getElementById("findPricesButton") ||
-      document.querySelector("wdpr-button#findPricesButton") ||
-      Array.from(document.querySelectorAll("wdpr-button,button,a,[role='button']"))
-        .find((n) => isViewRatesNode(n));
-    return el || null;
-  }
-
   function runScan() {
-    // Prefer calling an already-present scanner
     try {
       if (typeof window.__runRangeScan === "function") {
-        console.log("[scanner] calling window.__runRangeScan()");
+        log("calling window.__runRangeScan()");
         window.__runRangeScan();
         return;
       }
     } catch (_) {}
-
-    // Otherwise inject scan.js into the PAGE context
     const url = chrome.runtime.getURL("scan.js");
     const s = document.createElement("script");
     s.src = url;
     s.async = false;
     s.onload = () => s.remove();
     (document.head || document.documentElement).appendChild(s);
-    console.log("[scanner] injected scan.js");
+    log("injected scan.js");
   }
 
-  function runScanWithDelays() {
-    // Run immediately and again after a few delays to catch hydrated content
-    runScan();
-    setTimeout(runScan, 600);
-    setTimeout(runScan, 1600);
-    setTimeout(runScan, 3200);
-  }
+  function startScanBurst(label) {
+    log("scan burst start:", label);
+    const delays = [0, 300, 800, 1500, 2500, 4000, 7000, 10000, 15000];
+    delays.forEach(ms => setTimeout(runScan, ms));
 
-  // Global capture listeners (works through shadow DOM via composedPath)
-  document.addEventListener(
-    "click",
-    (e) => {
-      if (isViewRatesInPath(e)) {
-        console.log("[scanner] View Rates click detected");
-        runScanWithDelays();
-      }
-    },
-    true
-  );
+    // Patch fetch and XHR for ~10s to run scan after responses (new content)
+    const until = Date.now() + 10000;
+    try {
+      const _fetch = window.fetch;
+      window.fetch = async function() {
+        const res = await _fetch.apply(this, arguments);
+        if (Date.now() < until) setTimeout(runScan, 120);
+        return res;
+      };
+    } catch {}
+    try {
+      const _open = XMLHttpRequest.prototype.open;
+      const _send = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.open = function(){ this.__scanner = true; return _open.apply(this, arguments); };
+      XMLHttpRequest.prototype.send = function(){
+        if (this.__scanner) this.addEventListener("loadend", () => { if (Date.now() < until) setTimeout(runScan, 120); });
+        return _send.apply(this, arguments);
+      };
+    } catch {}
 
-  document.addEventListener(
-    "keydown",
-    (e) => {
-      const k = e.key || e.code;
-      if ((k === "Enter" || k === " ") && isViewRatesInPath(e)) {
-        console.log("[scanner] View Rates key activation detected");
-        runScanWithDelays();
-      }
-    },
-    true
-  );
-
-  // Attach a direct listener when/if the element appears (handles cases where composedPath doesn't include custom element)
-  const armDirectListener = () => {
-    const btn = findViewRatesElement();
-    if (btn && !btn.__scannerArmed) {
-      btn.addEventListener("click", () => {
-        console.log("[scanner] Direct listener: View Rates clicked");
-        runScanWithDelays();
-      }, true);
-      btn.addEventListener("keydown", (e) => {
-        const k = e.key || e.code;
-        if (k === "Enter" || k === " ") {
-          console.log("[scanner] Direct listener: View Rates key activation");
-          runScanWithDelays();
+    // Watch for dialogs/modals opening
+    const mo = new MutationObserver((mutations) => {
+      for (const m of mutations) {
+        for (const n of m.addedNodes) {
+          if (n && n.nodeType === Node.ELEMENT_NODE) {
+            const el = /** @type {Element} */ (n);
+            if (el.getAttribute("role") === "dialog" || el.getAttribute("aria-modal") === "true") {
+              log("dialog detected -> scan");
+              runScan();
+            }
+          }
         }
-      }, true);
-      btn.__scannerArmed = true;
-      console.log("[scanner] Direct listener armed on View Rates element");
+      }
+    });
+    mo.observe(document.documentElement, { childList: true, subtree: true });
+    setTimeout(() => mo.disconnect(), 15000);
+  }
+
+  // Global capture listeners
+  document.addEventListener("click", (e) => {
+    if (isViewRatesInPath(e)) {
+      log("View Rates click detected");
+      startScanBurst("click");
     }
-  };
+  }, true);
 
-  // Observe DOM for late insertion
-  const mo = new MutationObserver(() => armDirectListener());
-  mo.observe(document.documentElement, { subtree: true, childList: true });
-  // Try immediately and after short delays
-  armDirectListener();
-  setTimeout(armDirectListener, 800);
-  setTimeout(armDirectListener, 2000);
+  document.addEventListener("keydown", (e) => {
+    const k = e.key || e.code;
+    if ((k === "Enter" || k === " ") && isViewRatesInPath(e)) {
+      log("View Rates key activation detected");
+      startScanBurst("key");
+    }
+  }, true);
 
-  // Re-arm on SPA route changes
+  // SPA navigation support: re-arm after route changes
+  const rearm = () => log("listener armed for View Rates");
   ["popstate", "pushState", "replaceState"].forEach((evt) => {
-    window.addEventListener(evt, () => setTimeout(armDirectListener, 0));
+    window.addEventListener(evt, rearm);
   });
-
-  // Patch history methods to emit events on SPA navigations
   const _ps = history.pushState;
   history.pushState = function () {
     const r = _ps.apply(this, arguments);
@@ -130,5 +115,5 @@
     return r;
   };
 
-  console.log("[scanner] listener armed for View Rates");
+  rearm();
 })();
